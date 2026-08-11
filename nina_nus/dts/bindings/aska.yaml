@@ -1,0 +1,6 @@
+
+description: ASKA Multichannel NMES  
+
+compatible: "aska,kth"
+
+include: [base.yaml, sensor-device.yaml, spi-device.yaml]
