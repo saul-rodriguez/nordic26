@@ -1,0 +1,19 @@
+
+description: Custom gpios for ASKA project
+
+compatible: "custom-gpios"
+
+include: base.yaml
+
+child-binding:
+  description: Custom GPIO child node
+
+  properties:
+    gpios:
+      type: phandle-array
+      required: true
+
+    label:
+      type: string
+      required: false
+  
