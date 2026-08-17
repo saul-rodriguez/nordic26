@@ -1,0 +1,974 @@
+/*
+ * Copyright (c) 2018 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/** @file
+ *  @brief Nordic UART Bridge Service (NUS) sample
+ */
+#include <uart_async_adapter.h>
+
+#include <zephyr/types.h>
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/uart.h>
+
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <soc.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
+
+#include <bluetooth/services/nus.h>
+
+#include <dk_buttons_and_leds.h>
+
+#include <zephyr/settings/settings.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include <zephyr/logging/log.h>
+
+#include "adc_timer_ppi.h"
+
+#define LOG_MODULE_NAME peripheral_uart
+LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+
+#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
+#define PRIORITY  7
+
+#define DEVICE_NAME	CONFIG_BT_DEVICE_NAME
+#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+
+#define RUN_STATUS_LED	       DK_LED1
+#define RUN_LED_BLINK_INTERVAL 1000
+
+#define CON_STATUS_LED DK_LED2
+
+#define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
+#define KEY_PASSKEY_REJECT DK_BTN2_MSK
+
+#define UART_BUF_SIZE		CONFIG_BT_NUS_UART_BUFFER_SIZE
+#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
+#define UART_WAIT_FOR_RX	CONFIG_BT_NUS_UART_RX_WAIT_TIME
+
+static K_SEM_DEFINE(ble_init_ok, 0, 1);
+
+static struct bt_conn *current_conn;
+static struct bt_conn *auth_conn;
+static struct k_work adv_work;
+
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
+static struct k_work_delayable uart_work;
+/* STEP 6.2 - Declare the struct of the data item of the FIFOs */
+struct uart_data_t {
+	void *fifo_reserved;
+	uint8_t data[UART_BUF_SIZE];
+	uint16_t len;
+};
+/* STEP 6.1 - Declare the FIFOs */
+static K_FIFO_DEFINE(fifo_uart_tx_data);
+static K_FIFO_DEFINE(fifo_uart_rx_data);
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+};
+
+#ifdef CONFIG_UART_ASYNC_ADAPTER
+UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
+#else
+#define async_adapter NULL
+#endif
+
+
+/**************************
+ * SAULS CODE STARTS HERE
+ **************************/
+// All declarations added to the NUS example are added here.
+
+//Functions related to updatig physical layer and packet size
+
+static struct bt_gatt_exchange_params exchange_params;
+
+void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout);
+static void update_phy(struct bt_conn *conn);
+void on_le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param);
+static void update_data_length(struct bt_conn *conn);
+static void update_mtu(struct bt_conn *conn);
+void on_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info);
+static void exchange_func(struct bt_conn *conn, uint8_t att_err, struct bt_gatt_exchange_params *params);
+
+void send_data_over_bluetooth(uint8_t *data, uint16_t len);
+
+// ADC thread related code
+
+#define ADC_STACKSIZE		 2048
+#define ADC_CONSUMER_THREAD_PRIORITY 7
+
+static void receive_adc(void);
+
+//Other functions
+
+ /************************
+  * SAULS CODE ENDS HERE
+  ************************/
+
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+	ARG_UNUSED(dev);
+
+	static size_t aborted_len;
+	struct uart_data_t *buf;
+	static uint8_t *aborted_buf;
+	static bool disable_req;
+
+	switch (evt->type) {
+	case UART_TX_DONE:
+		LOG_DBG("UART_TX_DONE");
+		if ((evt->data.tx.len == 0) || (!evt->data.tx.buf)) {
+			return;
+		}
+
+		if (aborted_buf) {
+			buf = CONTAINER_OF(aborted_buf, struct uart_data_t, data[0]);
+			aborted_buf = NULL;
+			aborted_len = 0;
+		} else {
+			buf = CONTAINER_OF(evt->data.tx.buf, struct uart_data_t, data[0]);
+		}
+
+		k_free(buf);
+
+		buf = k_fifo_get(&fifo_uart_tx_data, K_NO_WAIT);
+		if (!buf) {
+			return;
+		}
+
+		if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS)) {
+			LOG_WRN("Failed to send data over UART");
+		}
+
+		break;
+
+	case UART_RX_RDY:
+		LOG_DBG("UART_RX_RDY");
+		buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data[0]);
+		buf->len += evt->data.rx.len;
+
+		if (disable_req) {
+			return;
+		}
+
+		if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
+		    (evt->data.rx.buf[buf->len - 1] == '\r')) {
+			disable_req = true;
+			uart_rx_disable(uart);
+		}
+
+		break;
+
+	case UART_RX_DISABLED:
+		LOG_DBG("UART_RX_DISABLED");
+		disable_req = false;
+
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+			k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+			return;
+		}
+
+		uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+
+		break;
+
+	case UART_RX_BUF_REQUEST:
+		LOG_DBG("UART_RX_BUF_REQUEST");
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+			uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+		}
+
+		break;
+
+	case UART_RX_BUF_RELEASED:
+		LOG_DBG("UART_RX_BUF_RELEASED");
+		buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t, data[0]);
+
+		if (buf->len > 0) {
+			/* STEP 9.1 -  Push the data received from the UART peripheral into the
+			 * fifo_uart_rx_data FIFO */
+
+			/**
+			 * SAULS CODE STARTS HERE
+			 */
+
+			// The logger does not use uart for data transmission. We disable sending the fifo here:
+
+			// k_fifo_put(&fifo_uart_rx_data, buf);
+
+			k_free(buf);
+			
+			/**
+			 * SAULS CODE ENDS HERE
+			 */
+			
+		} else {
+			k_free(buf);
+		}
+
+		break;
+
+	case UART_TX_ABORTED:
+		LOG_DBG("UART_TX_ABORTED");
+		if (!aborted_buf) {
+			aborted_buf = (uint8_t *)evt->data.tx.buf;
+		}
+
+		aborted_len += evt->data.tx.len;
+		buf = CONTAINER_OF((void *)aborted_buf, struct uart_data_t, data);
+
+		uart_tx(uart, &buf->data[aborted_len], buf->len - aborted_len, SYS_FOREVER_MS);
+
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void uart_work_handler(struct k_work *item)
+{
+	struct uart_data_t *buf;
+
+	buf = k_malloc(sizeof(*buf));
+	if (buf) {
+		buf->len = 0;
+	} else {
+		LOG_WRN("Not able to allocate UART receive buffer");
+		k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+		return;
+	}
+
+	uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+}
+
+static bool uart_test_async_api(const struct device *dev)
+{
+	const struct uart_driver_api *api = (const struct uart_driver_api *)dev->api;
+
+	return (api->callback_set != NULL);
+}
+
+static int uart_init(void)
+{
+	int err;
+	int pos;
+	struct uart_data_t *rx;
+	struct uart_data_t *tx;
+
+	if (!device_is_ready(uart)) {
+		return -ENODEV;
+	}
+
+	rx = k_malloc(sizeof(*rx));
+	if (rx) {
+		rx->len = 0;
+	} else {
+		return -ENOMEM;
+	}
+
+	k_work_init_delayable(&uart_work, uart_work_handler);
+
+	if (IS_ENABLED(CONFIG_UART_ASYNC_ADAPTER) && !uart_test_async_api(uart)) {
+		/* Implement API adapter */
+		uart_async_adapter_init(async_adapter, uart);
+		uart = async_adapter;
+	}
+
+	err = uart_callback_set(uart, uart_cb, NULL);
+	if (err) {
+		k_free(rx);
+		LOG_ERR("Cannot initialize UART callback");
+		return err;
+	}
+
+	if (IS_ENABLED(CONFIG_UART_LINE_CTRL)) {
+		LOG_INF("Wait for DTR");
+		while (true) {
+			uint32_t dtr = 0;
+
+			uart_line_ctrl_get(uart, UART_LINE_CTRL_DTR, &dtr);
+			if (dtr) {
+				break;
+			}
+			/* Give CPU resources to low priority threads. */
+			k_sleep(K_MSEC(100));
+		}
+		LOG_INF("DTR set");
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DCD, 1);
+		if (err) {
+			LOG_WRN("Failed to set DCD, ret code %d", err);
+		}
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DSR, 1);
+		if (err) {
+			LOG_WRN("Failed to set DSR, ret code %d", err);
+		}
+	}
+
+	tx = k_malloc(sizeof(*tx));
+
+	if (tx) {
+		pos = snprintf(tx->data, sizeof(tx->data),
+			       "Starting Nordic UART service example\r\n");
+
+		if ((pos < 0) || (pos >= sizeof(tx->data))) {
+			k_free(rx);
+			k_free(tx);
+			LOG_ERR("snprintf returned %d", pos);
+			return -ENOMEM;
+		}
+
+		tx->len = pos;
+	} else {
+		k_free(rx);
+		return -ENOMEM;
+	}
+
+	err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+	if (err) {
+		k_free(rx);
+		k_free(tx);
+		LOG_ERR("Cannot display welcome message (err: %d)", err);
+		return err;
+	}
+
+	err = uart_rx_enable(uart, rx->data, sizeof(rx->data), UART_WAIT_FOR_RX);
+	if (err) {
+		LOG_ERR("Cannot enable uart reception (err: %d)", err);
+		/* Free the rx buffer only because the tx buffer will be handled in the callback */
+		k_free(rx);
+	}
+
+	return err;
+}
+
+static void adv_work_handler(struct k_work *work)
+{
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	if (err) {
+		printk("Advertising failed to start (err %d)\n", err);
+		return;
+	}
+
+	printk("Advertising successfully started\n");
+}
+
+static void advertising_start(void)
+{
+	k_work_submit(&adv_work);
+}
+
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (err) {
+		//LOG_ERR("Connection failed, err 0x%02x ", err);
+		printk("Connection failed, err 0x%02x \n", err);
+		return;
+	}
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	//LOG_INF("Connected %s", addr);
+	printk("Connected %s\n", addr);
+
+	current_conn = bt_conn_ref(conn);
+
+	dk_set_led_on(CON_STATUS_LED);
+
+	/**
+	 * SAULS CODE STARTS HERE
+	 */
+	struct bt_conn_info info;
+	err = bt_conn_get_info(conn, &info);
+	if (err) {
+		printk("bt_conn_get_info() returned %d\n", err);
+		return;
+	}
+
+	double connection_interval = BT_GAP_US_TO_CONN_INTERVAL(info.le.interval_us) *1.25; // in ms
+	uint16_t supervision_timeout = info.le.timeout*10; // in ms
+	printk("Connection parameters: interval %.2f ms, latency %d intervals, timeout %d ms\n", connection_interval, info.le.latency, supervision_timeout);
+
+	update_phy(current_conn);
+
+	k_sleep(K_MSEC(1000));  // Delay added to avoid link layer collisions.
+	update_data_length(current_conn);
+	update_mtu(current_conn);
+
+	 /**
+	  * SAULS CODE ENDS HERE
+	  */
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Disconnected: %s, reason 0x%02x", addr, reason);
+
+	if (auth_conn) {
+		bt_conn_unref(auth_conn);
+		auth_conn = NULL;
+	}
+
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+		dk_set_led_off(CON_STATUS_LED);
+	}
+}
+
+static void recycled_cb(void)
+{
+	printk("Connection object available from previous conn. Disconnect is complete!\n");
+	advertising_start();
+}
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (!err) {
+		LOG_INF("Security changed: %s level %u", addr, level);
+	} else {
+		LOG_WRN("Security failed: %s level %u err %d", addr, level, err);
+	}
+}
+#endif
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+	.recycled = recycled_cb,
+	
+	/**
+	 * SAULS CODE STARTS HERE
+	 */
+	.le_param_updated       = on_le_param_updated,
+	.le_phy_updated         = on_le_phy_updated,
+	.le_data_len_updated    = on_le_data_len_updated,
+
+	 /**
+	  * SAULS CODE ENDS HERE
+	  */
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	.security_changed = security_changed,
+#endif
+};
+
+#if defined(CONFIG_BT_NUS_SECURITY_ENABLED)
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+}
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	auth_conn = bt_conn_ref(conn);
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+
+	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF54HX) || IS_ENABLED(CONFIG_SOC_SERIES_NRF54LX)) {
+		LOG_INF("Press Button 0 to confirm, Button 1 to reject.");
+	} else {
+		LOG_INF("Press Button 1 to confirm, Button 2 to reject.");
+	}
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing cancelled: %s", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing completed: %s, bonded: %d", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing failed conn: %s, reason %d", addr, reason);
+}
+
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
+	.cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {.pairing_complete = pairing_complete,
+							       .pairing_failed = pairing_failed};
+#else
+static struct bt_conn_auth_cb conn_auth_callbacks;
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
+#endif
+
+static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
+{
+	int err;
+	char addr[BT_ADDR_LE_STR_LEN] = {0};
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, ARRAY_SIZE(addr));
+
+	LOG_INF("Received data from: %s", addr);
+
+	/**
+	 * SAULS CODE STARTS HERE
+	 */
+
+	 // Here is where we add our code consuming the data received over Bluetooth (data) and its length (len)
+	 // In this example, we will forward the data received over Bluetooth to the UART peripheral.
+	
+	 /*
+	char aux[20];	
+	for (int i = 0; i < len; i++) {
+		aux[i] = data[i];
+		printk("0x%X\n",aux[i]);
+	} */
+	
+
+	 /**
+	  * SAULS CODE ENDS HERE
+	  */
+
+	for (uint16_t pos = 0; pos != len;) {
+		struct uart_data_t *tx = k_malloc(sizeof(*tx));
+
+		if (!tx) {
+			LOG_WRN("Not able to allocate UART send data buffer");
+			return;
+		}
+
+		/* Keep the last byte of TX buffer for potential LF char. */
+		size_t tx_data_size = sizeof(tx->data) - 1;
+
+		if ((len - pos) > tx_data_size) {
+			tx->len = tx_data_size;
+		} else {
+			tx->len = (len - pos);
+		}
+
+		memcpy(tx->data, &data[pos], tx->len);
+
+		pos += tx->len;
+
+		/* Append the LF character when the CR character triggered
+		 * transmission from the peer.
+		 */
+		if ((pos == len) && (data[len - 1] == '\r')) {
+			tx->data[tx->len] = '\n';
+			tx->len++;
+		}
+		/* STEP 8.3 - Forward the data received over Bluetooth LE to the UART peripheral */
+		err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+		if (err) {
+			k_fifo_put(&fifo_uart_tx_data, tx);
+		}
+	}
+}
+/* STEP 8.1 - Create a variable of type bt_nus_cb and initialize it */
+static struct bt_nus_cb nus_cb = {
+	.received = bt_receive_cb,
+};
+
+void error(void)
+{
+	dk_set_leds_state(DK_ALL_LEDS_MSK, DK_NO_LEDS_MSK);
+
+	while (true) {
+		/* Spin for ever */
+		k_sleep(K_MSEC(1000));
+	}
+}
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void num_comp_reply(bool accept)
+{
+	if (accept) {
+		bt_conn_auth_passkey_confirm(auth_conn);
+		LOG_INF("Numeric Match, conn %p", (void *)auth_conn);
+	} else {
+		bt_conn_auth_cancel(auth_conn);
+		LOG_INF("Numeric Reject, conn %p", (void *)auth_conn);
+	}
+
+	bt_conn_unref(auth_conn);
+	auth_conn = NULL;
+}
+
+void button_changed(uint32_t button_state, uint32_t has_changed)
+{
+	uint32_t buttons = button_state & has_changed;
+
+	if (auth_conn) {
+		if (buttons & KEY_PASSKEY_ACCEPT) {
+			num_comp_reply(true);
+		}
+
+		if (buttons & KEY_PASSKEY_REJECT) {
+			num_comp_reply(false);
+		}
+	}
+}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+
+static void configure_gpio(void)
+{
+	int err;
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	err = dk_buttons_init(button_changed);
+	if (err) {
+		LOG_ERR("Cannot init buttons (err: %d)", err);
+	}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+
+	err = dk_leds_init();
+	if (err) {
+		LOG_ERR("Cannot init LEDs (err: %d)", err);
+	}
+}
+
+
+/***************************
+ * 
+ * SAULS CODE STARTS HERE
+ * 
+ **************************/
+
+ // CODE FROM LESSON 3 - EXERCISE 2, updating connection parameters and physical layer to maximize throughput
+
+ void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
+{
+    double connection_interval = interval*1.25;         // in ms
+    uint16_t supervision_timeout = timeout*10;          // in ms
+    printk("Connection parameters updated: interval %.2f ms, latency %d intervals, timeout %d ms\n", connection_interval, latency, supervision_timeout);
+}
+
+static void update_phy(struct bt_conn *conn)
+{
+    int err;
+    const struct bt_conn_le_phy_param preferred_phy = {
+        .options = BT_CONN_LE_PHY_OPT_NONE,
+        .pref_rx_phy = BT_GAP_LE_PHY_2M,
+        .pref_tx_phy = BT_GAP_LE_PHY_2M,
+    };
+    err = bt_conn_le_phy_update(conn, &preferred_phy);
+    if (err) {
+        printk("bt_conn_le_phy_update() returned %d\n", err);
+    }
+}
+
+void on_le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
+{
+    // PHY Updated
+    if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_1M) {
+        printk("PHY updated. New PHY: 1M\n");
+    }
+    else if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_2M) {
+        printk("PHY updated. New PHY: 2M\n");
+    }
+    else if (param->tx_phy == BT_CONN_LE_TX_POWER_PHY_CODED_S8) {
+        printk("PHY updated. New PHY: Long Range\n");
+    }
+}
+
+static void update_data_length(struct bt_conn *conn)
+{
+    int err;
+    struct bt_conn_le_data_len_param my_data_len = {
+        .tx_max_len = BT_GAP_DATA_LEN_MAX,
+        .tx_max_time = BT_GAP_DATA_TIME_MAX,
+    };
+    err = bt_conn_le_data_len_update(current_conn, &my_data_len);
+    if (err) {
+        printk("data_len_update failed (err %d)\n", err);
+    }
+}
+
+static void update_mtu(struct bt_conn *conn)
+{
+    int err;
+    exchange_params.func = exchange_func;
+
+    err = bt_gatt_exchange_mtu(conn, &exchange_params);
+    if (err) {
+        printk("bt_gatt_exchange_mtu failed (err %d)\n", err);
+    }
+}
+
+void on_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info)
+{
+    uint16_t tx_len     = info->tx_max_len; 
+    uint16_t tx_time    = info->tx_max_time;
+    uint16_t rx_len     = info->rx_max_len;
+    uint16_t rx_time    = info->rx_max_time;
+    printk("Data length updated. Length %d/%d bytes, time %d/%d us\n", tx_len, rx_len, tx_time, rx_time);
+}
+
+static void exchange_func(struct bt_conn *conn, uint8_t att_err,
+			  struct bt_gatt_exchange_params *params)
+{
+	printk("MTU exchange %s", att_err == 0 ? "successful\n" : "failed\n");
+    if (!att_err) {
+        uint16_t payload_mtu = bt_gatt_get_mtu(conn) - 3;   // 3 bytes used for Attribute headers.
+        printk("New MTU: %d bytes\n", payload_mtu);
+    }
+}
+
+void send_data_over_bluetooth(uint8_t *data, uint16_t len)
+{
+	
+	int err;
+
+	if (current_conn) {
+		err = bt_nus_send(NULL, data, len);
+		if (err) {
+			printk("Failed to send data over Bluetooth (err %d)\n", err);
+		}
+	} else {
+		printk("No active connection. Cannot send data.\n");
+	}
+}
+
+
+static void receive_adc(void)
+{
+	
+	while (1) {
+		struct data_item_t *rec_item;
+		rec_item = k_fifo_get(&ADCfifo, K_FOREVER);
+		//printk("Consumer: %s\tSize: %u\n", rec_item->data, rec_item->len);
+      
+		//comment debug prints to avoid performance issues 
+		//printk("Consumer: size: %u\n", rec_item->len);
+        //printk("Data[0]: %u\n", rec_item->data[0]);
+
+		uint8_t data_to_send[2*MAX_DATA_SIZE];
+
+		int index = 0;
+		for (int i = 0; i < rec_item->len; i++) {
+			data_to_send[index++] = rec_item->data[i] & 0xFF; // Low byte
+			data_to_send[index++] = (rec_item->data[i] >> 8) & 0xFF; // High byte			
+		}
+
+		send_data_over_bluetooth(data_to_send, 2*MAX_DATA_SIZE);
+		
+
+        /*
+        for (int i = 0; i < rec_item->len; i++) {
+            printk("Data[%d]: %u\n", i, rec_item->data[i]);
+        }
+        */
+
+		k_free(rec_item);
+	}
+}
+
+ /************************
+  * 
+  * SAULS CODE ENDS HERE
+  * 
+  ************************/
+
+int main(void)
+{
+	int blink_status = 0;
+	int err = 0;
+
+	/**
+	 * SAULS CODE STARTS HERE
+	 */
+
+	 //These variables are used to test send_data_over_bluetooth() function
+	
+	//uint8_t data_to_send[100];
+	//int counter = 0;
+
+	 /**
+	  * SAULS CODE ENDS HERE
+	  */
+	 
+
+	printk("Starting Lesson 4 - Exercise 3 \n");
+	configure_gpio();
+	/* STEP 7 - Initialize the UART Peripheral  */
+	err = uart_init();
+	if (err) {
+		error();
+	}
+
+	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err) {
+			printk("Failed to register authorization callbacks.\n");
+			return 0;
+		}
+
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err) {
+			printk("Failed to register authorization info callbacks.\n");
+			return 0;
+		}
+	}
+
+	err = bt_enable(NULL);
+	if (err) {
+		error();
+	}
+
+	LOG_INF("Bluetooth initialized");
+
+	k_sem_give(&ble_init_ok);
+
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
+	}
+	/* STEP 8.2 - Pass your application callback function to the NUS service */
+	err = bt_nus_init(&nus_cb);
+	if (err) {
+		LOG_ERR("Failed to initialize UART service (err: %d)", err);
+		return 0;
+	}
+
+	k_work_init(&adv_work, adv_work_handler);
+	advertising_start();
+
+	/*************************
+	 * SAULS CODE STARTS HERE
+	 *************************/
+
+	 // Other initialization code can be added here
+
+	// Configure tha ADC 
+	configure_timer();
+    configure_saadc();  
+    configure_ppi();
+
+	 /***********************
+	  * SAULS CODE ENDS HERE
+	  ***********************/
+
+	for (;;) {
+
+		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
+		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
+
+		/************************
+		* SAULS CODE STARTS HERE
+		*************************/
+		//sprintf((char *)data_to_send, "Hello from the peripheral! %d\n", counter++);
+		//send_data_over_bluetooth(data_to_send, strlen((char *)data_to_send));
+
+		/***********************
+		 * SAULS CODE ENDS HERE
+		 ***********************/
+	}
+}
+
+
+/* STEP 9.3 - Define the thread function  */
+void ble_write_thread(void)
+{
+	/* Don't go any further until BLE is initialized */
+	k_sem_take(&ble_init_ok, K_FOREVER);
+	struct uart_data_t nus_data = {
+		.len = 0,
+	};
+
+	for (;;) {
+		/* Wait indefinitely for data to be sent over bluetooth */
+		struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data, K_FOREVER);
+
+		int plen = MIN(sizeof(nus_data.data) - nus_data.len, buf->len);
+		int loc = 0;
+
+		while (plen > 0) {
+			memcpy(&nus_data.data[nus_data.len], &buf->data[loc], plen);
+			nus_data.len += plen;
+			loc += plen;
+
+			if (nus_data.len >= sizeof(nus_data.data) ||
+			    (nus_data.data[nus_data.len - 1] == '\n') ||
+			    (nus_data.data[nus_data.len - 1] == '\r')) {
+				if (bt_nus_send(NULL, nus_data.data, nus_data.len)) {
+					LOG_WRN("Failed to send data over BLE connection");
+				}
+				nus_data.len = 0;
+			}
+
+			plen = MIN(sizeof(nus_data.data), buf->len - loc);
+		}
+
+		k_free(buf);
+	}
+}
+/* STEP 9.2 - Create a dedicated thread for sending the data over Bluetooth LE. */
+
+/**
+ * SAULS CODE STARTS HERE
+ */
+
+// The thread to forward UART data to Bluetooth is not used in logger. We comment it out.
+
+// K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL, NULL, PRIORITY, 0, 0);
+
+/**
+ * SAULS CODE ENDS HERE
+ */
+
+K_THREAD_DEFINE(receive_adc_thread, ADC_STACKSIZE, receive_adc, NULL, NULL, NULL, ADC_CONSUMER_THREAD_PRIORITY, 0,0);
+
