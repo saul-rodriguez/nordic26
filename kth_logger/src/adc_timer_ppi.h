@@ -32,6 +32,9 @@ void saadc_event_handler(nrfx_saadc_evt_t const * p_event);
 void configure_saadc(void);
 void configure_ppi(void);
 
+void enable_pii(void);
+void disable_pii(void);
+
 //FIFO related code
 void sendADCdata(int16_t adc_value);
 

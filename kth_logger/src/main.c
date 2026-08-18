@@ -34,6 +34,7 @@
 #include <zephyr/logging/log.h>
 
 #include "adc_timer_ppi.h"
+#include "kth_logger.h"
 
 #define LOG_MODULE_NAME peripheral_uart
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
@@ -115,6 +116,9 @@ void send_data_over_bluetooth(uint8_t *data, uint16_t len);
 #define ADC_CONSUMER_THREAD_PRIORITY 7
 
 static void receive_adc(void);
+
+
+// Logger related code
 
 //Other functions
 
@@ -579,7 +583,10 @@ static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data, uint1
 		printk("0x%X\n",aux[i]);
 	} */
 	
-
+	// Forward the data received over Bluetooth to the kth logger message handler.
+	KTH_LOGGER_getCommand(data, len);  
+	
+	
 	 /**
 	  * SAULS CODE ENDS HERE
 	  */

@@ -31,6 +31,9 @@ static uint32_t saadc_current_buffer = 0;
  uint16_t ADC_data[MAX_DATA_SIZE];
  uint16_t ADC_data_counter = 0;
 
+nrfx_gppi_handle_t gppi_handle_sample;
+nrfx_gppi_handle_t gppi_handle_start;
+
 void test()
 {
     //LOG_ERR("TEST");
@@ -190,8 +193,8 @@ void configure_ppi(void)
 {
     int err;
     /* STEP 6.1 - Declare variables used to hold the (D)PPI channel number */
-    nrfx_gppi_handle_t gppi_handle_sample;
-    nrfx_gppi_handle_t gppi_handle_start;
+    // nrfx_gppi_handle_t gppi_handle_sample;
+    // nrfx_gppi_handle_t gppi_handle_start;
 
     /* STEP 6.2 - Trigger task sample from timer */
     err = nrfx_gppi_conn_alloc(nrfx_timer_compare_event_address_get(&timer_instance, NRF_TIMER_CC_CHANNEL0),
@@ -211,8 +214,9 @@ void configure_ppi(void)
     }
 
     /* STEP 6.4 - Enable both (D)PPI channels */ 
-    nrfx_gppi_conn_enable(gppi_handle_sample);
-    nrfx_gppi_conn_enable(gppi_handle_start);
+    // We enable the PPI in a separate function to allow the user to enable/disable the PPI from the Bluetooth command handler.
+    //nrfx_gppi_conn_enable(gppi_handle_sample);
+    //nrfx_gppi_conn_enable(gppi_handle_start);
 
 }
 
@@ -249,6 +253,21 @@ void sendADCdata(int16_t adc_value)
         ADC_data_counter = 0;
     }
 }
+
+void enable_pii(void)
+{
+    /* STEP 6.4 - Enable both (D)PPI channels */ 
+    nrfx_gppi_conn_enable(gppi_handle_sample);
+    nrfx_gppi_conn_enable(gppi_handle_start);
+}
+
+void disable_pii(void)
+{
+    /* STEP 6.4 - Disable both (D)PPI channels */ 
+    nrfx_gppi_conn_disable(gppi_handle_sample);
+    nrfx_gppi_conn_disable(gppi_handle_start);
+}
+
 
  /*
 
