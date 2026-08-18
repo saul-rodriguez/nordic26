@@ -449,6 +449,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		current_conn = NULL;
 		dk_set_led_off(CON_STATUS_LED);
 	}
+
+	/**
+	 * SAULS CODE STARTS HERE
+	 */
+
+	 KTH_LOGGER_disableSampling();  // Disable sending samples when the connection is lost.
+
+	 /**
+	  * SAULS CODE ENDS HERE
+	  */
 }
 
 static void recycled_cb(void)
@@ -899,6 +909,7 @@ int main(void)
 	 *************************/
 
 	 // Other initialization code can be added here
+	KTH_LOGGER_init();  // Initialize the KTH logger module including the SPI interface
 
 	// Configure tha ADC 
 	configure_timer();
@@ -920,6 +931,7 @@ int main(void)
 		//sprintf((char *)data_to_send, "Hello from the peripheral! %d\n", counter++);
 		//send_data_over_bluetooth(data_to_send, strlen((char *)data_to_send));
 
+		//KTH_LOGGER_testSPI();  // Test the SPI interface with the logger module. This function is used for testing purposes only.
 		/***********************
 		 * SAULS CODE ENDS HERE
 		 ***********************/
