@@ -2,6 +2,7 @@
 #include <zephyr/sys/printk.h>
 
 #include "adc_timer_ppi.h"
+#include "gpios.h"
 
 // flag to indicate if samples should be sent or not
 int KTH_LOGGER_send_samples;
@@ -84,9 +85,11 @@ void KTH_LOGGER_getCommand(const uint8_t *data, size_t len)
             case 's':
                 KTH_LOGGER_enableSampling();
                 break;
+
             case 'S':
                 KTH_LOGGER_disableSampling();
                 break;
+
             case 'w':
                 if (len == 6) {
 
@@ -102,6 +105,26 @@ void KTH_LOGGER_getCommand(const uint8_t *data, size_t len)
                 } else {
                     printk(" - Invalid write command format\n");
                 }
+                break;
+
+            case 'o':
+                out1_on();
+                printk(" - Output 1 turned ON\n");
+                break;
+
+            case 'O':
+                out1_off();
+                printk(" - Output 1 turned OFF\n");
+                break;
+
+            case 'p':
+                out2_on();
+                printk(" - Output 1 turned ON\n");
+                break;
+
+            case 'P':
+                out2_off();
+                printk(" - Output 1 turned OFF\n");
                 break;
 
             default:

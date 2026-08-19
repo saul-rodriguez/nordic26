@@ -49,14 +49,14 @@
     custom_gpios{
         compatible = "custom-gpios";
 
-        enhv: en_hv_pin{
-            gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;      /*GPIO_2 */
-            label = "High voltage enable for ASKA";
+        out1: out_1_pin{
+            gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;      /*GPIO_2 */
+            label = "Digital output 1 KTH Logger";
         };
 
-        resetn: resetn_pin{
-            gpios = <&gpio0 10 GPIO_ACTIVE_LOW>;     /*GPIO_29 */
-            label = "Reset for ASKA";
+        out2: out_2_pin{
+            gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;     /*GPIO_29 */
+            label = "Digital output 2 KTH Logger";
         };
     };
 };
@@ -105,8 +105,8 @@
 /{
     aliases{
         statusled = &status_led;
-        enhv  = &enhv;
-        resetn = &resetn;
+        out1  = &out1;
+        out2 = &out2;
     };
 };
 

@@ -27,4 +27,6 @@ void KTH_LOGGER_getCommand(const uint8_t *data, size_t len);
 void KTH_LOGGER_enableSampling(void);
 void KTH_LOGGER_disableSampling(void);
 
+
+
 #endif // KTH_LOGGER_H

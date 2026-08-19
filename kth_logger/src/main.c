@@ -34,7 +34,10 @@
 #include <zephyr/logging/log.h>
 
 #include "adc_timer_ppi.h"
+#include "gpios.h"
 #include "kth_logger.h"
+
+
 
 #define LOG_MODULE_NAME peripheral_uart
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
@@ -915,6 +918,8 @@ int main(void)
 	configure_timer();
     configure_saadc();  
     configure_ppi();
+
+	configure_KTH_logger_gpio();  // Configure the GPIOs used by the KTH logger module.
 
 	 /***********************
 	  * SAULS CODE ENDS HERE
