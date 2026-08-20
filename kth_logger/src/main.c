@@ -35,8 +35,8 @@
 
 #include "adc_timer_ppi.h"
 #include "gpios.h"
+#include "pwm_clk.h"
 #include "kth_logger.h"
-
 
 
 #define LOG_MODULE_NAME peripheral_uart
@@ -920,6 +920,7 @@ int main(void)
     configure_ppi();
 
 	configure_KTH_logger_gpio();  // Configure the GPIOs used by the KTH logger module.
+	pwm_clk_setup();  // Configure the PWM clock output used by the KTH logger module.
 
 	 /***********************
 	  * SAULS CODE ENDS HERE
@@ -927,7 +928,7 @@ int main(void)
 
 	for (;;) {
 
-		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
+		//dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
 		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
 
 		/************************

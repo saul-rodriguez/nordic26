@@ -3,6 +3,7 @@
 
 #include "adc_timer_ppi.h"
 #include "gpios.h"
+#include "pwm_clk.h"
 
 // flag to indicate if samples should be sent or not
 int KTH_LOGGER_send_samples;
@@ -127,6 +128,22 @@ void KTH_LOGGER_getCommand(const uint8_t *data, size_t len)
                 printk(" - Output 1 turned OFF\n");
                 break;
 
+            case 'c':
+                if (len == 2) {
+                    uint32_t freqKhz = (uint32_t)data[1];
+                    pwm_clk_start(freqKhz); // Start PWM clock at specified frequency
+                    printk(" - PWM clock started at %u kHz\n", freqKhz);
+                } else {
+                    printk(" - Invalid clock command format\n");
+                }
+                
+                break;
+
+            case 'C':
+                pwm_clk_stop(); // Stop PWM clock
+                printk(" - PWM clock stopped\n");
+                break;
+                
             default:
                 printk(" - Invalid command\n");
                 break;
